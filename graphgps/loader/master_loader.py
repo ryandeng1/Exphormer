@@ -1,4 +1,6 @@
 import logging
+from torch_geometric.data import download_url
+import os
 import os.path as osp
 import time
 import math
@@ -175,6 +177,7 @@ def load_dataset_master(format, name, dataset_dir):
         dataset = load_pyg(name, dataset_dir)
 
     elif format == 'OGB':
+        print("name: ", name)
         if name.startswith('ogbg'):
             dataset = preformat_OGB_Graph(dataset_dir, name.replace('_', '-'))
 
@@ -182,6 +185,7 @@ def load_dataset_master(format, name, dataset_dir):
             subset = name.split('-', 1)[1]
             dataset = preformat_OGB_PCQM4Mv2(dataset_dir, subset)
         elif name.startswith('ogbn'):
+            print("preformat")
             dataset = preformat_ogbn(dataset_dir, name)
 
         elif name.startswith('peptides-'):
@@ -207,6 +211,7 @@ def load_dataset_master(format, name, dataset_dir):
             raise ValueError(f"Unsupported OGB(-derived) dataset: {name}")
     else:
         raise ValueError(f"Unknown data format: {format}")
+
     log_loaded_dataset(dataset, format, name)
 
     # Precompute necessary statistics for positional encodings.
@@ -336,6 +341,65 @@ def load_dataset_master(format, name, dataset_dir):
             dataset[dataset.data['train_graph_index']])
 
     return dataset
+
+def get_arxiv_year_dataset(dataset):
+    return dataset
+    input_feature_dim, output_dim = 128, 5
+    dataset.__num_classes__ = 5
+    y = even_quantile_labels(dataset.data.node_year.flatten().numpy(), nclasses=5, verbose=False)
+    dataset.data.y = torch.as_tensor(y).reshape(-1, 1)
+    # Tran, val and test masks are required during preprocessing. Setting them here to dummy values as
+    # they are overwritten later for this dataset (see get_dataset_split function below)
+    # dataset._data.train_mask, dataset._data.val_mask, dataset._data.test_mask = 0, 0, 0
+    split_number = 0
+    root_dir = "./dataset"
+    num_nodes = dataset[0].y.shape[0]
+    github_url = f"https://github.com/CUAI/Non-Homophily-Large-Scale/raw/master/data/splits/"
+    split_file_name = f"arxiv-year-splits.npy"
+    local_dir = os.path.join(root_dir, "arxiv-year".replace("-", "_"), "raw")
+    url = os.path.join(github_url, split_file_name)
+    download_url(url, local_dir, log=False)
+    splits = np.load(os.path.join(local_dir, split_file_name), allow_pickle=True)
+    split_idx = splits[split_number % len(splits)]
+
+    split_dict = {'train': torch.Tensor(split_idx['train']).to(torch.long), 'val': torch.Tensor(split_idx['valid']).to(torch.long), 'test': torch.Tensor(split_idx['test']).to(torch.long)}
+    dataset.split_idx = split_dict
+    return dataset
+
+
+def get_mask(idx, num_nodes):
+    """
+    Given a tensor of ids and a number of nodes, return a boolean mask of size num_nodes which is set to True at indices
+    in `idx`, and to False for other indices.
+    """
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    mask[idx] = 1
+    return mask
+
+def even_quantile_labels(vals, nclasses, verbose=True):
+    """partitions vals into nclasses by a quantile based split,
+    where the first class is less than the 1/nclasses quantile,
+    second class is less than the 2/nclasses quantile, and so on
+
+    vals is np array
+    returns an np array of int class labels
+    """
+    label = -1 * np.ones(vals.shape[0], dtype=np.int64)
+    interval_lst = []
+    lower = -np.inf
+    for k in range(nclasses - 1):
+        upper = np.nanquantile(vals, (k + 1) / nclasses)
+        interval_lst.append((lower, upper))
+        inds = (vals >= lower) * (vals < upper)
+        label[inds] = k
+        lower = upper
+    label[vals >= lower] = nclasses - 1
+    interval_lst.append((lower, np.inf))
+    if verbose:
+        print("Class Label Intervals:")
+        for class_idx, interval in enumerate(interval_lst):
+            print(f"Class {class_idx}: [{interval[0]}, {interval[1]})]")
+    return label
 
 
 def compute_indegree_histogram(dataset):
@@ -623,12 +687,15 @@ def preformat_ogbn(dataset_dir, name):
       pre_transform_in_memory(dataset, partial(add_reverse_edges))
       if cfg.prep.add_self_loops:
         pre_transform_in_memory(dataset, partial(add_self_loops))
+      
     if name == 'ogbn-proteins':
       pre_transform_in_memory(dataset, partial(move_node_feat_to_x))
       pre_transform_in_memory(dataset, partial(typecast_x, type_str='float'))
     split_dict = dataset.get_idx_split()
     split_dict['val'] = split_dict.pop('valid')
     dataset.split_idx = split_dict
+    if name == 'ogbn-arxiv':
+      dataset = get_arxiv_year_dataset(dataset)
     return dataset
 
 

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.nn as pygnn
 from performer_pytorch import SelfAttention
+import torch_geometric
 from torch_geometric.data import Batch
 from torch_geometric.nn import Linear as Linear_pyg
 from torch_geometric.utils import to_dense_batch
@@ -13,7 +14,7 @@ from graphgps.layer.gine_conv_layer import GINEConvESLapPE
 from graphgps.layer.bigbird_layer import SingleBigBirdLayer
 from graphgps.layer.ETransformer import ETransformer
 from graphgps.layer.Exphormer import ExphormerAttention
-
+from graphgps.layer.Longnet import MultiheadDilatedAttention, LongNet
 
 class LocalModel(nn.Module):
     def __init__(self, dim_h, local_gnn_type, edge_type, edge_attr_type, num_heads,
@@ -149,6 +150,9 @@ class GlobalModel(nn.Module):
         self.edge_type = edge_type
         self.edge_attr_type = edge_attr_type
 
+        self.permutation = None
+        self.inverse_permutation = None
+
         # Global attention transformer-style model.
         if global_model_type == 'Transformer':
             self.self_attn = torch.nn.MultiheadAttention(
@@ -163,6 +167,13 @@ class GlobalModel(nn.Module):
             self.self_attn = ExphormerAttention(dim_h, dim_h, num_heads,
                                           use_bias=False, 
                                           use_virt_nodes= exp_edges_cfg.num_virt_node > 0)
+        elif global_model_type == 'Dilated':
+            # dilation_rates = [1, 2, 4, 6, 12, 16]
+            # segment_lengths = [2048, 4096, 8192, 16384, 32768, 65536]
+            dilation_rates = [1, 2, 4, 6, 12]
+            segment_lengths = [2048, 4096, 8192, 16384, 32768]
+            # self.self_attn = MultiheadDilatedAttention(dim_h, num_heads, dilation_rates, segment_lengths)
+            self.self_attn = LongNet(dim_h, num_heads, 3, 3, dim_h, segment_lengths, dilation_rates, dropout=0.5)
         elif global_model_type == 'Performer':
             self.self_attn = SelfAttention(
                 dim=dim_h, heads=num_heads,
@@ -193,7 +204,33 @@ class GlobalModel(nn.Module):
 
         # Multi-head attention.
         if self.global_model_type in ['ETransformer', 'Exphormer']:
+            # h_attn = torch.utils.checkpoint.checkpoint(self.self_attn, batch)
             h_attn = self.self_attn(batch)
+        elif self.global_model_type == 'Dilated':
+            if self.permutation is None and False:
+                # assert self.inverse_permutation is None
+                # cluster_data = torch_geometric.loader.ClusterData(batch, num_parts=8192, recursive=True)
+                self.permutation = torch.randperm(h.size(0), device=h.device)
+                # self.permutation = cluster_data.perm.to(torch.long)
+                self.inverse_permutation = torch.empty_like(self.permutation)
+                self.inverse_permutation[self.permutation] = torch.arange(self.permutation.size(0), device=self.permutation.device)
+
+            padding_size = 27265
+            padding = torch.full((padding_size, h.size(-1)), 0, device=h.device)
+            batched_input = torch.unsqueeze(torch.cat([h, padding]), 0)
+            # h_attn = self.self_attn(query=batched_input, key=batched_input, value=batched_input)
+            h_attn = self.self_attn(batched_input)
+            h_attn = torch.squeeze(h_attn)
+            h_attn = h_attn[:-padding_size]
+            """
+            perm_h = batch.x[self.permutation]
+            padding = torch.full((padding_size, h.size(-1)), 0, device=h.device)
+            batched_input = torch.unsqueeze(torch.cat([perm_h, padding]), 0)
+            h_attn = self.self_attn(query=batched_input, key=batched_input, value=batched_input)
+            h_attn = torch.squeeze(h_attn)
+            h_attn = h_attn[:-padding_size]
+            h_attn = h_attn[self.inverse_permutation]
+            """
         else:
             h_dense, mask = to_dense_batch(h, batch.batch)
             if self.global_model_type == 'Transformer':
@@ -269,7 +306,7 @@ class MultiLayer(nn.Module):
                 use_edge_attr = True
                 layer_type = layer_type[0]
 
-            if layer_type in {'Transformer', 'ETransformer', 'Exphormer', 'Performer', 'BigBird'}:
+            if layer_type in {'Transformer', 'ETransformer', 'Exphormer', 'Performer', 'BigBird', 'Dilated'}:
                 self.models.append(GlobalModel(dim_h=dim_h,
                                             global_model_type=layer_type,
                                             edge_type = edge_type,
